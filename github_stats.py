@@ -213,6 +213,67 @@ query {
 """
 
     @staticmethod
+    def user_organizations() -> str:
+        """
+        :return: GraphQL query to get organizations the user is a member of
+        """
+        return """
+query {
+  viewer {
+    organizations(first: 100) {
+      nodes {
+        login
+        name
+      }
+    }
+  }
+}
+"""
+
+    @staticmethod
+    def org_repos_overview(org_name: str, cursor: Optional[str] = None) -> str:
+        """
+        :param org_name: organization name
+        :param cursor: pagination cursor
+        :return: GraphQL query with overview of organization repositories
+        """
+        return f"""{{
+  organization(login: "{org_name}") {{
+    repositories(
+        first: 100,
+        orderBy: {{
+            field: UPDATED_AT,
+            direction: DESC
+        }},
+        isFork: false,
+        after: {"null" if cursor is None else '"'+ cursor +'"'}
+    ) {{
+      pageInfo {{
+        hasNextPage
+        endCursor
+      }}
+      nodes {{
+        nameWithOwner
+        stargazers {{
+          totalCount
+        }}
+        forkCount
+        languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
+          edges {{
+            size
+            node {{
+              name
+              color
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+"""
+
+    @staticmethod
     def contribs_by_year(year: str) -> str:
         """
         :param year: year to query for
@@ -273,6 +334,7 @@ class Stats(object):
         self._repos: Optional[Set[str]] = None
         self._lines_changed: Optional[Tuple[int, int]] = None
         self._views: Optional[int] = None
+        self._organizations: Optional[List[Dict]] = None
 
     async def to_str(self) -> str:
         """
@@ -283,6 +345,10 @@ class Stats(object):
             [f"{k}: {v:0.4f}%" for k, v in languages.items()]
         )
         lines_changed = await self.lines_changed
+        organizations = await self.organizations
+        org_names = [org.get("name", org.get("login", "Unknown")) for org in organizations]
+        formatted_orgs = ", ".join(org_names) if org_names else "None"
+        
         return f"""Name: {await self.name}
 Stargazers: {await self.stargazers:,}
 Forks: {await self.forks:,}
@@ -292,6 +358,7 @@ Lines of code added: {lines_changed[0]:,}
 Lines of code deleted: {lines_changed[1]:,}
 Lines of code changed: {lines_changed[0] + lines_changed[1]:,}
 Project page views: {await self.views:,}
+Organizations: {formatted_orgs}
 Languages:
   - {formatted_languages}"""
 
@@ -374,11 +441,71 @@ Languages:
             else:
                 break
 
+        # Get organization statistics
+        await self.get_org_stats()
+
         # TODO: Improve languages to scale by number of contributions to
         #       specific filetypes
         langs_total = sum([v.get("size", 0) for v in self._languages.values()])
         for k, v in self._languages.items():
             v["prop"] = 100 * (v.get("size", 0) / langs_total)
+
+    async def get_org_stats(self) -> None:
+        """
+        Get statistics from organization repositories and add them to user stats
+        """
+        organizations = await self.organizations
+        exclude_langs_lower = {x.lower() for x in self._exclude_langs}
+
+        for org in organizations:
+            org_name = org.get("login")
+            if not org_name:
+                continue
+
+            print(f"Processing organization: {org_name}")
+            
+            next_cursor = None
+            while True:
+                raw_results = await self.queries.query(
+                    Queries.org_repos_overview(org_name, cursor=next_cursor)
+                )
+                raw_results = raw_results if raw_results is not None else {}
+
+                org_data = raw_results.get("data", {}).get("organization", {})
+                if not org_data:
+                    break
+
+                repos_data = org_data.get("repositories", {})
+                repos = repos_data.get("nodes", [])
+
+                for repo in repos:
+                    if repo is None:
+                        continue
+                    name = repo.get("nameWithOwner")
+                    if name in self._repos or name in self._exclude_repos:
+                        continue
+                    self._repos.add(name)
+                    self._stargazers += repo.get("stargazers").get("totalCount", 0)
+                    self._forks += repo.get("forkCount", 0)
+
+                    for lang in repo.get("languages", {}).get("edges", []):
+                        lang_name = lang.get("node", {}).get("name", "Other")
+                        if lang_name.lower() in exclude_langs_lower:
+                            continue
+                        if lang_name in self._languages:
+                            self._languages[lang_name]["size"] += lang.get("size", 0)
+                            self._languages[lang_name]["occurrences"] += 1
+                        else:
+                            self._languages[lang_name] = {
+                                "size": lang.get("size", 0),
+                                "occurrences": 1,
+                                "color": lang.get("node", {}).get("color"),
+                            }
+
+                if repos_data.get("pageInfo", {}).get("hasNextPage", False):
+                    next_cursor = repos_data.get("pageInfo", {}).get("endCursor")
+                else:
+                    break
 
     @property
     async def name(self) -> str:
@@ -447,6 +574,19 @@ Languages:
         return self._repos
 
     @property
+    async def organizations(self) -> List[Dict]:
+        """
+        :return: list of organizations the user is a member of
+        """
+        if self._organizations is not None:
+            return self._organizations
+        
+        raw_results = await self.queries.query(Queries.user_organizations())
+        orgs = raw_results.get("data", {}).get("viewer", {}).get("organizations", {}).get("nodes", [])
+        self._organizations = orgs
+        return self._organizations
+
+    @property
     async def total_contributions(self) -> int:
         """
         :return: count of user's total contributions as defined by GitHub
@@ -483,7 +623,8 @@ Languages:
             return self._lines_changed
         additions = 0
         deletions = 0
-        for repo in await self.repos:
+        repos = await self.repos  # This will now include org repos
+        for repo in repos:
             r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
             for author_obj in r:
                 # Handle malformed response from the API by skipping this repo
@@ -512,7 +653,8 @@ Languages:
             return self._views
 
         total = 0
-        for repo in await self.repos:
+        repos = await self.repos  # This will now include org repos
+        for repo in repos:
             r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
             for view in r.get("views", []):
                 total += view.get("count", 0)
