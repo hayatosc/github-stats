@@ -349,11 +349,18 @@ class Stats(object):
         org_names = [org.get("name", org.get("login", "Unknown")) for org in organizations]
         formatted_orgs = ", ".join(org_names) if org_names else "None"
         
+        # Calculate user vs org repos
+        repos = await self.repos
+        user_repos = [repo for repo in repos if f"{self.username}/" in repo]
+        org_repos = [repo for repo in repos if f"{self.username}/" not in repo]
+        
         return f"""Name: {await self.name}
 Stargazers: {await self.stargazers:,}
 Forks: {await self.forks:,}
 All-time contributions: {await self.total_contributions:,}
-Repositories with contributions: {len(await self.repos)}
+Repositories with contributions: {len(repos)}
+  - User repositories: {len(user_repos)}
+  - Organization repositories: {len(org_repos)}
 Lines of code added: {lines_changed[0]:,}
 Lines of code deleted: {lines_changed[1]:,}
 Lines of code changed: {lines_changed[0] + lines_changed[1]:,}
@@ -416,14 +423,13 @@ Languages:
 
                 for lang in repo.get("languages", {}).get("edges", []):
                     name = lang.get("node", {}).get("name", "Other")
-                    languages = await self.languages
                     if name.lower() in exclude_langs_lower:
                         continue
-                    if name in languages:
-                        languages[name]["size"] += lang.get("size", 0)
-                        languages[name]["occurrences"] += 1
+                    if name in self._languages:
+                        self._languages[name]["size"] += lang.get("size", 0)
+                        self._languages[name]["occurrences"] += 1
                     else:
-                        languages[name] = {
+                        self._languages[name] = {
                             "size": lang.get("size", 0),
                             "occurrences": 1,
                             "color": lang.get("node", {}).get("color"),
@@ -457,12 +463,15 @@ Languages:
         organizations = await self.organizations
         exclude_langs_lower = {x.lower() for x in self._exclude_langs}
 
+        print(f"Found {len(organizations)} organizations")
+        
         for org in organizations:
             org_name = org.get("login")
             if not org_name:
                 continue
 
             print(f"Processing organization: {org_name}")
+            repo_count = 0
             
             next_cursor = None
             while True:
@@ -473,10 +482,13 @@ Languages:
 
                 org_data = raw_results.get("data", {}).get("organization", {})
                 if not org_data:
+                    print(f"  No data found for organization: {org_name}")
                     break
 
                 repos_data = org_data.get("repositories", {})
                 repos = repos_data.get("nodes", [])
+                
+                print(f"  Found {len(repos)} repositories in this batch")
 
                 for repo in repos:
                     if repo is None:
@@ -484,9 +496,15 @@ Languages:
                     name = repo.get("nameWithOwner")
                     if name in self._repos or name in self._exclude_repos:
                         continue
+                    
+                    repo_count += 1
                     self._repos.add(name)
-                    self._stargazers += repo.get("stargazers").get("totalCount", 0)
-                    self._forks += repo.get("forkCount", 0)
+                    stars = repo.get("stargazers").get("totalCount", 0)
+                    forks = repo.get("forkCount", 0)
+                    self._stargazers += stars
+                    self._forks += forks
+                    
+                    print(f"    Added repo: {name} (stars: {stars}, forks: {forks})")
 
                     for lang in repo.get("languages", {}).get("edges", []):
                         lang_name = lang.get("node", {}).get("name", "Other")
@@ -506,6 +524,8 @@ Languages:
                     next_cursor = repos_data.get("pageInfo", {}).get("endCursor")
                 else:
                     break
+            
+            print(f"  Total repositories added from {org_name}: {repo_count}")
 
     @property
     async def name(self) -> str:
