@@ -178,10 +178,15 @@ class Queries(object):
       }}
       nodes {{
         nameWithOwner
+        owner {{
+          login
+          __typename
+        }}
         stargazers {{
           totalCount
         }}
         forkCount
+        isPrivate
         languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
           edges {{
             size
@@ -273,6 +278,58 @@ query {
 }}
 """
 
+    @staticmethod
+    def enhanced_contrib_repos(cursor: Optional[str] = None) -> str:
+        """
+        :param cursor: pagination cursor
+        :return: Enhanced GraphQL query to get user's contributed repositories with better organization support
+        """
+        return f"""{{
+  viewer {{
+    repositoriesContributedTo(
+        first: 100,
+        includeUserRepositories: false,
+        orderBy: {{
+            field: UPDATED_AT,
+            direction: DESC
+        }},
+        contributionTypes: [
+            COMMIT,
+            PULL_REQUEST,
+            REPOSITORY,
+            PULL_REQUEST_REVIEW
+        ],
+        after: {"null" if cursor is None else '"'+ cursor +'"'}
+    ) {{
+      pageInfo {{
+        hasNextPage
+        endCursor
+      }}
+      nodes {{
+        nameWithOwner
+        owner {{
+          login
+          __typename
+        }}
+        stargazers {{
+          totalCount
+        }}
+        forkCount
+        isPrivate
+        languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
+          edges {{
+            size
+            node {{
+              name
+              color
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+."""
     @staticmethod
     def contribs_by_year(year: str) -> str:
         """
@@ -417,19 +474,32 @@ Languages:
                 name = repo.get("nameWithOwner")
                 if name in self._repos or name in self._exclude_repos:
                     continue
+                
+                # Check repository details for better organization handling
+                owner = repo.get("owner", {})
+                owner_type = owner.get("__typename", "")
+                is_private = repo.get("isPrivate", False)
+                
                 self._repos.add(name)
-                self._stargazers += repo.get("stargazers").get("totalCount", 0)
-                self._forks += repo.get("forkCount", 0)
+                stars = repo.get("stargazers").get("totalCount", 0)
+                forks = repo.get("forkCount", 0)
+                self._stargazers += stars
+                self._forks += forks
+                
+                # Log private repository access for debugging
+                if is_private:
+                    repo_type = "organization" if owner_type == "Organization" else "user"
+                    print(f"  Found private {repo_type} repository: {name}")
 
                 for lang in repo.get("languages", {}).get("edges", []):
-                    name = lang.get("node", {}).get("name", "Other")
-                    if name.lower() in exclude_langs_lower:
+                    lang_name = lang.get("node", {}).get("name", "Other")
+                    if lang_name.lower() in exclude_langs_lower:
                         continue
-                    if name in self._languages:
-                        self._languages[name]["size"] += lang.get("size", 0)
-                        self._languages[name]["occurrences"] += 1
+                    if lang_name in self._languages:
+                        self._languages[lang_name]["size"] += lang.get("size", 0)
+                        self._languages[lang_name]["occurrences"] += 1
                     else:
-                        self._languages[name] = {
+                        self._languages[lang_name] = {
                             "size": lang.get("size", 0),
                             "occurrences": 1,
                             "color": lang.get("node", {}).get("color"),
@@ -458,53 +528,69 @@ Languages:
 
     async def get_org_stats(self) -> None:
         """
-        Get statistics from organization repositories and add them to user stats
-        """
-        organizations = await self.organizations
-        exclude_langs_lower = {x.lower() for x in self._exclude_langs}
-
-        print(f"Found {len(organizations)} organizations")
+        Get statistics from organization repositories where the user has contributed
+        This method enhances GitHub Organization support by:
+        1. Efficiently querying only repositories where the user has made contributions
+        2. Properly handling private organization repositories (with appropriate token permissions)
+        3. Including both public and private organization repositories in statistics
+        4. Filtering to avoid double-counting repositories already processed
         
-        for org in organizations:
-            org_name = org.get("login")
-            if not org_name:
-                continue
+        This is more efficient and accurate than getting all organization repositories
+        since it focuses only on repositories where the user has actual contributions.
+        """
+        print("Getting enhanced organization contribution statistics...")
+        exclude_langs_lower = {x.lower() for x in self._exclude_langs}
+        
+        # Use the enhanced query to get contributed repositories
+        next_cursor = None
+        org_repos_found = 0
+        
+        while True:
+            raw_results = await self.queries.query(
+                Queries.enhanced_contrib_repos(cursor=next_cursor)
+            )
+            raw_results = raw_results if raw_results is not None else {}
 
-            print(f"Processing organization: {org_name}")
-            repo_count = 0
+            contrib_repos = (
+                raw_results.get("data", {})
+                .get("viewer", {})
+                .get("repositoriesContributedTo", {})
+            )
             
-            next_cursor = None
-            while True:
-                raw_results = await self.queries.query(
-                    Queries.org_repos_overview(org_name, cursor=next_cursor)
-                )
-                raw_results = raw_results if raw_results is not None else {}
+            if not contrib_repos:
+                print("  No additional contributed repositories found")
+                break
 
-                org_data = raw_results.get("data", {}).get("organization", {})
-                if not org_data:
-                    print(f"  No data found for organization: {org_name}")
-                    break
+            repos = contrib_repos.get("nodes", [])
+            print(f"  Found {len(repos)} contributed repositories in this batch")
 
-                repos_data = org_data.get("repositories", {})
-                repos = repos_data.get("nodes", [])
-                
-                print(f"  Found {len(repos)} repositories in this batch")
-
-                for repo in repos:
-                    if repo is None:
-                        continue
-                    name = repo.get("nameWithOwner")
-                    if name in self._repos or name in self._exclude_repos:
-                        continue
+            for repo in repos:
+                if repo is None:
+                    continue
                     
-                    repo_count += 1
+                name = repo.get("nameWithOwner")
+                if name in self._repos or name in self._exclude_repos:
+                    continue
+                
+                # Check if this is an organization repository
+                owner = repo.get("owner", {})
+                owner_type = owner.get("__typename", "")
+                owner_login = owner.get("login", "")
+                
+                # Only count organization repositories (not user repositories)
+                if owner_type == "Organization" and owner_login != self.username:
+                    org_repos_found += 1
                     self._repos.add(name)
+                    
                     stars = repo.get("stargazers").get("totalCount", 0)
                     forks = repo.get("forkCount", 0)
+                    is_private = repo.get("isPrivate", False)
+                    
                     self._stargazers += stars
                     self._forks += forks
                     
-                    print(f"    Added repo: {name} (stars: {stars}, forks: {forks})")
+                    privacy_status = "private" if is_private else "public"
+                    print(f"    Added org repo: {name} ({privacy_status}) (stars: {stars}, forks: {forks})")
 
                     for lang in repo.get("languages", {}).get("edges", []):
                         lang_name = lang.get("node", {}).get("name", "Other")
@@ -520,12 +606,12 @@ Languages:
                                 "color": lang.get("node", {}).get("color"),
                             }
 
-                if repos_data.get("pageInfo", {}).get("hasNextPage", False):
-                    next_cursor = repos_data.get("pageInfo", {}).get("endCursor")
-                else:
-                    break
-            
-            print(f"  Total repositories added from {org_name}: {repo_count}")
+            if contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
+                next_cursor = contrib_repos.get("pageInfo", {}).get("endCursor")
+            else:
+                break
+        
+        print(f"  Total organization repositories with contributions: {org_repos_found}")
 
     @property
     async def name(self) -> str:
