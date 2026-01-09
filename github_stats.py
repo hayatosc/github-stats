@@ -599,9 +599,13 @@ Languages:
                     
                     if isinstance(r, list):
                         for author_obj in r:
-                            if not isinstance(author_obj, dict):
+                            # Handle malformed response from the API
+                            if author_obj is None or not isinstance(author_obj, dict):
                                 continue
-                            author = author_obj.get("author", {}).get("login", "")
+                            author_info = author_obj.get("author", {})
+                            if not isinstance(author_info, dict):
+                                continue
+                            author = author_info.get("login", "")
                             if author == self.username:
                                 has_commits = True
                                 break
