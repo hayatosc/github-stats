@@ -534,11 +534,12 @@ Languages:
     async def get_org_stats(self) -> None:
         """
         Get statistics from repositories in organizations the user belongs to.
-        This method:
-        1. Gets all organizations the user is a member of
-        2. For each organization (or only included ones if specified), gets all repositories
-        3. Checks if the user has commits in each repository using REST API
-        4. Includes repositories with user commits in the statistics
+        This method efficiently:
+        1. Gets repositories where the user has contributed (using repositoriesContributedTo)
+        2. Filters by organizations the user is a member of
+        3. Optionally filters by specified organizations (INCLUDED_ORGS)
+        
+        This approach avoids slow REST API calls to /stats/contributors for every org repo.
         """
         print("Getting organization repository statistics...")
         exclude_langs_lower = self._exclude_langs
@@ -551,99 +552,93 @@ Languages:
             print("  No organizations found")
             return
         
+        # Create a set of organization logins for efficient lookup
+        org_logins = {org.get("login", "").lower() for org in orgs}
         print(f"  Found {len(orgs)} organizations")
+        
+        # Filter by included organizations if specified
+        if self._included_orgs is not None:
+            included_lower = {o.lower() for o in self._included_orgs}
+            org_logins = org_logins & included_lower
+            print(f"  Filtering to {len(org_logins)} included organizations")
+        
+        if not org_logins:
+            print("  No organizations to process after filtering")
+            return
+        
         org_repos_found = 0
         
-        for org in orgs:
-            org_login = org.get("login", "")
-            org_name = org.get("name", org_login)
+        # Get contributed repositories (which includes org repos where user has commits)
+        next_cursor = None
+        while True:
+            raw_results = await self.queries.query(
+                Queries.enhanced_contrib_repos(cursor=next_cursor)
+            )
+            raw_results = raw_results if raw_results is not None else {}
+
+            contrib_repos = (
+                raw_results.get("data", {})
+                .get("viewer", {})
+                .get("repositoriesContributedTo", {})
+            )
             
-            # Filter by included organizations if specified
-            if self._included_orgs is not None and org_login.lower() not in {o.lower() for o in self._included_orgs}:
-                print(f"  Skipping organization: {org_name} (not in included list)")
-                continue
-            
-            print(f"  Processing organization: {org_name}")
-            
-            # Get all repositories for this organization
-            next_cursor = None
-            while True:
-                raw_results = await self.queries.query(
-                    Queries.org_repos_overview(org_login, cursor=next_cursor)
-                )
-                raw_results = raw_results if raw_results is not None else {}
+            if not contrib_repos:
+                break
+
+            repos = contrib_repos.get("nodes", [])
+
+            for repo in repos:
+                if repo is None:
+                    continue
+                    
+                name = repo.get("nameWithOwner")
+                if name in self._repos or name in self._exclude_repos:
+                    continue
                 
-                org_repos = (
-                    raw_results.get("data", {})
-                    .get("organization", {})
-                    .get("repositories", {})
-                )
+                # Check if this is an organization repository from user's orgs
+                owner = repo.get("owner", {})
+                owner_type = owner.get("__typename", "")
+                owner_login = owner.get("login", "")
                 
-                if not org_repos:
-                    break
+                # Only process organization repositories that match our criteria
+                if owner_type != "Organization":
+                    continue
+                if owner_login.lower() not in org_logins:
+                    continue
                 
-                repos = org_repos.get("nodes", [])
-                print(f"    Found {len(repos)} repositories in this batch")
+                # This repo is from a relevant organization and user has contributed
+                org_repos_found += 1
+                self._repos.add(name)
                 
-                for repo in repos:
-                    if repo is None:
+                stars = repo.get("stargazers", {}).get("totalCount", 0)
+                forks = repo.get("forkCount", 0)
+                is_private = repo.get("isPrivate", False)
+                
+                self._stargazers += stars
+                self._forks += forks
+                
+                privacy_status = "private" if is_private else "public"
+                print(f"  Added org repo: {name} ({privacy_status}, stars: {stars}, forks: {forks})")
+
+                # Process languages
+                for lang in repo.get("languages", {}).get("edges", []):
+                    lang_name = lang.get("node", {}).get("name", "Other")
+                    if lang_name.lower() in exclude_langs_lower:
                         continue
-                    
-                    name = repo.get("nameWithOwner")
-                    if name in self._repos or name in self._exclude_repos:
-                        continue
-                    
-                    # Check if user has commits in this repository
-                    r = await self.queries.query_rest(f"/repos/{name}/stats/contributors")
-                    has_commits = False
-                    
-                    if isinstance(r, list):
-                        for author_obj in r:
-                            # Handle malformed response from the API
-                            if author_obj is None or not isinstance(author_obj, dict):
-                                continue
-                            author_info = author_obj.get("author", {})
-                            if not isinstance(author_info, dict):
-                                continue
-                            author = author_info.get("login", "")
-                            if author == self.username:
-                                has_commits = True
-                                break
-                    
-                    if not has_commits:
-                        continue
-                    
-                    # Add repository to statistics
-                    org_repos_found += 1
-                    self._repos.add(name)
-                    
-                    stars = repo.get("stargazers", {}).get("totalCount", 0)
-                    forks = repo.get("forkCount", 0)
-                    
-                    self._stargazers += stars
-                    self._forks += forks
-                    
-                    print(f"      Added org repo: {name} (stars: {stars}, forks: {forks})")
-                    
-                    # Process languages
-                    for lang in repo.get("languages", {}).get("edges", []):
-                        lang_name = lang.get("node", {}).get("name", "Other")
-                        if lang_name.lower() in exclude_langs_lower:
-                            continue
-                        if lang_name in self._languages:
-                            self._languages[lang_name]["size"] += lang.get("size", 0)
-                            self._languages[lang_name]["occurrences"] += 1
-                        else:
-                            self._languages[lang_name] = {
-                                "size": lang.get("size", 0),
-                                "occurrences": 1,
-                                "color": lang.get("node", {}).get("color"),
-                            }
-                
-                if org_repos.get("pageInfo", {}).get("hasNextPage", False):
-                    next_cursor = org_repos.get("pageInfo", {}).get("endCursor")
-                else:
-                    break
+                    if lang_name in self._languages:
+                        self._languages[lang_name]["size"] += lang.get("size", 0)
+                        self._languages[lang_name]["occurrences"] += 1
+                    else:
+                        self._languages[lang_name] = {
+                            "size": lang.get("size", 0),
+                            "occurrences": 1,
+                            "color": lang.get("node", {}).get("color"),
+                        }
+
+            if contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
+                next_cursor = contrib_repos.get("pageInfo", {}).get("endCursor")
+            else:
+                break
         
         print(f"  Total organization repositories with user commits: {org_repos_found}")
 
