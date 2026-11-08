@@ -23,11 +23,11 @@ GitHub Stats Visualization is a Python application that generates SVG badges sho
 
 ### GitHub Actions Execution
 - Primary execution method is via GitHub Actions workflow (`.github/workflows/main.yml`)
-- Workflow runs on Ubuntu with Python 3.8
+- Workflow runs on Ubuntu with Python 3.12
 - Executes automatically on push to master and weekly on schedule
 - Workflow steps:
   1. Checkout repository
-  2. Setup Python 3.8
+  2. Setup Python 3.12
   3. Install dependencies -- takes 1-2 minutes. NEVER CANCEL. Set timeout to 5+ minutes.
   4. Generate images -- takes 2-10 minutes depending on user's repository count. NEVER CANCEL. Set timeout to 15+ minutes.
   5. Commit generated files
